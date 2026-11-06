@@ -6,3 +6,6 @@ sentence-transformers
 qdrant-client
 sqlalchemy
 aiosqlite
+streamlit
+requests
+pandas
