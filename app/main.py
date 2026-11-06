@@ -1,8 +1,18 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
 from app.api.routes import router
+from app.db.database import init_db
 
-app = FastAPI(title="VanguardAI Gateway")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await init_db()
+    yield
+
+
+app = FastAPI(title="VanguardAI Gateway", lifespan=lifespan)
 app.include_router(router, prefix="/v1")
 
 

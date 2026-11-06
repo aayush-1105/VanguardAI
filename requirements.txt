@@ -2,3 +2,7 @@ fastapi
 uvicorn
 python-dotenv
 openai
+sentence-transformers
+qdrant-client
+sqlalchemy
+aiosqlite
