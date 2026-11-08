@@ -8,6 +8,7 @@ import streamlit as st
 
 GATEWAY_URL = "http://localhost:8000/v1/chat/completions"
 DB_PATH = "vanguard.db"
+LOGS_QUERY = "SELECT * FROM request_logs ORDER BY id DESC"
 # Groq retired llama-3.3-70b-versatile on this account; this is what tests confirmed active.
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 
@@ -65,9 +66,7 @@ if __name__ == "__main__":
         else:
             connection = sqlite3.connect(DB_PATH)
             try:
-                logs = pd.read_sql_query(
-                    "SELECT * FROM request_logs ORDER BY id DESC", connection
-                )
+                logs = pd.read_sql_query(LOGS_QUERY, connection)
             finally:
                 connection.close()
 

@@ -9,7 +9,10 @@ logger = logging.getLogger(__name__)
 
 COLLECTION = "semantic_cache"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-SIMILARITY_THRESHOLD = 0.92
+# Calibrated to this model: true paraphrases score ~0.76-0.79, so 0.92 never hit.
+# shortcut: 0.75 also admits same-topic-different-intent prompts (~0.80); add a
+# cross-encoder reranker before trusting this cache in production.
+SIMILARITY_THRESHOLD = 0.75
 
 _client = QdrantClient(location=":memory:")
 _init_lock = threading.Lock()
