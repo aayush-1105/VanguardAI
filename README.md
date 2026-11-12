@@ -12,15 +12,15 @@ POST /v1/chat/completions   ->   scrub   ->   cache   ->   provider   ->   rehyd
 
 ### Bidirectional PII Tokenization
 
-Emails, phone numbers, credit cards, Aadhaar numbers, and API keys are replaced with reversible tokens (`{{EMAIL_1}}`, `{{PHONE_1}}`, ...) before a prompt reaches a provider. The provider never sees the raw value; the caller always does. Tokens are numbered per category across a conversation and identical values reuse the same token, so a vault is consistent for the whole request.
+Emails, phone numbers, credit cards, Aadhaar numbers, and API keys are replaced with reversible tokens (`{{EMAIL_1}}`, `{{PHONE_1}}`, ...) before a prompt reaches a provider. The provider never sees the raw value; the caller always does. Tokens are numbered per category across a conversation and identical values reuse the same token, so a vault is consistent for the whole request. The tag-to-raw map is stored in Redis under a 300-second TTL, so any worker can rehydrate the response and the raw values leave storage on their own.
 
 ### Sliding-Window Stream Rehydration
 
 Restoring tokens in a stream is not a simple string replace, because a tag regularly arrives split across chunk boundaries (`"...is {{EMA"` + `"IL_1}} and"`). A lookahead buffer holds back any text from the last unmatched `{{` until the tag closes, then substitutes and emits it with the correct chunk. A 64-character cap guarantees that a literal `{{` in model prose can never stall the stream. Non-streaming responses use the same substitution applied once.
 
-### Sub-30ms Semantic Caching
+### Two-Stage Semantic Caching
 
-Prompts are embedded with `all-MiniLM-L6-v2` and matched against an in-memory Qdrant collection using cosine similarity. A hit at or above the similarity threshold returns the stored answer in roughly 10-25 ms on a warm process, with no provider call and zero logged cost. Only tokenized text is stored, so a cached answer is rehydrated with the requesting client's vault rather than leaking another caller's values.
+Prompts are embedded with `all-MiniLM-L6-v2` and the three nearest neighbours are retrieved from Qdrant. A bi-encoder cannot separate a paraphrase from a same-topic question with a different intent (both score around `0.8`), so each candidate is then scored pairwise by `cross-encoder/ms-marco-MiniLM-L6-v2`. Only a candidate whose cross-encoder score clears `0.05` after a sigmoid is served; anything else falls through to the provider. Measured on this pair of models, identical prompts score `0.996` and same-topic-different-intent prompts stay below `0.007`, so the cutoff trades a few missed paraphrases for never returning the wrong answer. Only tokenized text is stored, so a cached answer is rehydrated with the requesting client's vault rather than leaking another caller's values.
 
 ### Provider Fallback Cascade
 
@@ -54,13 +54,13 @@ Every request - cache hit or miss - is written to `request_logs` in `vanguard.db
               |
               v
   +-----------------------+        {{EMAIL_1}} -> raw on the way back
-  |  PIIScrubber          |        per-request vault of tokens
+  |  PIIScrubber          |        vault in Redis, 300s TTL
   +-----------+-----------+
               |
               v
   +-----------------------+        hit  -> rehydrate -> client (0 cost)
   |  Semantic cache       |  -----------------------------> client
-  |  Qdrant, in-memory    |
+  |  Qdrant + cross-encoder    |
   +-----------+-----------+
               |  miss
               v
@@ -95,7 +95,7 @@ Request lifecycle:
 
 ### Prerequisites
 
-Python 3.11 or newer, and API keys for at least one provider. Installing `sentence-transformers` pulls PyTorch, so expect a few hundred MB on first install and roughly 90 MB on first model download.
+Python 3.11 or newer, and API keys for at least one provider. Installing `sentence-transformers` pulls PyTorch, so expect a few hundred MB on first install and roughly 200 MB across the two model downloads.
 
 ### 1. Install
 
@@ -154,6 +154,25 @@ curl -N http://localhost:8000/v1/chat/completions \
 
 Model ids are provider-specific and change over time. `openai/gpt-oss-20b` and `openai/gpt-oss-120b` are valid Groq ids today; `llama-3.3-70b-versatile` may be retired on your account. DeepSeek ids such as `deepseek/deepseek-chat` route to OpenRouter.
 
+### 6. Or run the whole stack with Docker
+
+```bash
+docker compose up --build
+```
+
+Three services start: `api` on `:8000`, `redis` on `:6379`, and `qdrant` on `:6333`. The API reads `REDIS_URL` and `QDRANT_URL` from the compose environment, so the PII vault and the semantic cache are shared between workers instead of living in one process. Model weights are cached in the `hf_cache` volume; `vanguard.db` stays inside the container, so attach a volume if the telemetry must survive a rebuild.
+
+Docker is not required for local development. Without `QDRANT_URL` the cache uses an in-memory Qdrant, and a Redis connection is only attempted when a vault is used - if it is unreachable the vault falls back to an in-process dict and logs a warning.
+
+## Load Testing
+
+```bash
+pip install -r requirements.txt
+locust -f locustfile.py --host http://localhost:8000
+```
+
+Open `http://localhost:8089`, choose the number of users, and start. The test posts to `/v1/chat/completions`; since every user sends the same prompt, most requests become cache hits after the first one, which measures the gateway path rather than provider latency. Run it against the Docker stack to exercise Redis and a networked Qdrant.
+
 ## Project Layout
 
 ```
@@ -174,7 +193,10 @@ app/
     log_service.py     telemetry writes and cost estimation
   main.py              application factory and lifespan
 dashboard.py           Streamlit chat UI and telemetry view
-tests/                 25-test end-to-end suite
+Dockerfile             API image
+docker-compose.yml     api + redis + qdrant
+locustfile.py          load test for /v1/chat/completions
+tests/                 28-test end-to-end suite
 requirements.txt
 ```
 
@@ -182,17 +204,17 @@ Runtime artifacts: `vanguard.db` (SQLite telemetry), created on first start. It 
 
 ## Testing
 
-The repository ships a 25-test end-to-end suite powered by pytest. Providers are replaced with fakes, so the suite is deterministic, runs offline, and never spends API credits.
+The repository ships a 28-test end-to-end suite powered by pytest. Providers are replaced with fakes and Redis with `fakeredis`, so the suite is deterministic, runs offline, and never spends API credits. The cross-encoder is also stubbed, so the tests download no model beyond the bi-encoder.
 
 ```bash
 python -m pytest tests -q
 ```
 
 ```
-25 passed in 24.40s
+28 passed in 20.11s
 ```
 
-Coverage includes PII pattern detection and token numbering, scrub-before-dispatch, cache hit/miss behavior with no upstream call on a hit, model routing, upstream error mapping, log persistence, non-stream rehydration, streaming rehydration of tags split across chunk boundaries, the fallback cascade on `429`, prompt-injection rejection, and cost telemetry (miss charges, hit is free).
+Coverage includes PII pattern detection and token numbering, the Redis vault and its TTL, scrub-before-dispatch, cache hit/miss behavior with no upstream call on a hit, cross-encoder rejection and top-K rerank selection, model routing, upstream error mapping, log persistence, non-stream rehydration, streaming rehydration of tags split across chunk boundaries, the fallback cascade on `429`, prompt-injection rejection, and cost telemetry (miss charges, hit is free).
 
 ## Configuration Reference
 
@@ -201,14 +223,16 @@ Coverage includes PII pattern detection and token numbering, scrub-before-dispat
 | `GROQ_API_KEY` | yes | Default provider for all non-DeepSeek models |
 | `OPENROUTER_API_KEY` | yes | DeepSeek models, and the fallback target when Groq fails |
 | `GOOGLE_API_KEY` | yes | Loaded at startup; reserved for a future provider route |
+| `REDIS_URL` | no | PII vault store; defaults to `redis://localhost:6379/0` |
+| `QDRANT_URL` | no | Remote Qdrant; defaults to an in-memory collection |
 
-Tunable constants live next to the code that uses them: `SIMILARITY_THRESHOLD` in `app/services/cache_service.py`, `FALLBACK_MODELS` in `app/services/llm_service.py`, pricing in `app/services/log_service.py`, and the guard patterns in `app/services/security_service.py`.
+Tunable constants live next to the code that uses them: `SIMILARITY_THRESHOLD`, `CROSS_ENCODER_THRESHOLD`, and `RERANK_CANDIDATES` in `app/services/cache_service.py`, `VAULT_TTL_SECONDS` in `app/services/pii_service.py`, `FALLBACK_MODELS` in `app/services/llm_service.py`, pricing in `app/services/log_service.py`, and the guard patterns in `app/services/security_service.py`.
 
 ## Known Limitations
 
 - **No authentication on the gateway.** Anyone who can reach `/v1` can spend the configured provider keys. Put it behind a reverse proxy with auth, or add an API-key dependency, before exposing it.
-- **The cache and vaults are per-process and in-memory.** Both are lost on restart and are not shared across multiple uvicorn workers.
+- **Telemetry is still per process.** The PII vault is shared through Redis and the cache through Qdrant, but `request_logs` lives in the container's SQLite file.
 - **Cost is an estimate.** Prices are derived from character counts at 4 characters per token, using a flat rate, rather than from provider-reported usage.
 - **The injection guard is a heuristic.** It flags the literal phrase "system prompt", so a legitimate question about prompts is rejected as well.
-- **The cache threshold is tuned for recall.** At `0.75`, semantically adjacent prompts can return another prompt's answer.
+- **The cache favours precision.** MS MARCO is a query-to-passage reranker, so it under-scores question pairs: a valid paraphrase can miss the cache and reach the provider. A wrong answer is never served in its place.
 - **Failover changes the model.** A DeepSeek request that falls back is answered by the secondary provider's model, which is reflected in the response's `model` field.

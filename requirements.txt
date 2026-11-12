@@ -9,4 +9,7 @@ aiosqlite
 streamlit
 requests
 pandas
+redis
 pytest
+fakeredis
+locust

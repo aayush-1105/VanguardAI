@@ -5,6 +5,7 @@ are replaced with fakes, so the suite is deterministic and never touches the
 network.
 """
 
+import asyncio
 import json
 import py_compile
 import re
@@ -13,6 +14,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import fakeredis
 import httpx
 import openai
 import pandas as pd
@@ -20,7 +22,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.services import cache_service, llm_service
+from app.services import cache_service, llm_service, pii_service
 from app.services.pii_service import PIIScrubber
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -143,6 +145,40 @@ def _warm_model(client):
     cache_service._ensure_ready()
 
 
+class _FakeReranker:
+    """Stands in for the cross-encoder, which is a download and a CPU pass.
+
+    It does not need to imitate the real model's scores, only its ordering:
+    spreading the bi-encoder cosine into a logit keeps related prompts far above
+    CROSS_ENCODER_THRESHOLD and unrelated ones far below it.
+    """
+
+    def predict(self, pairs):
+        return [(_embed_cosine(a, b) - 0.6) * 12 for a, b in pairs]
+
+
+def _embed_cosine(a: str, b: str) -> float:
+    vector_a = cache_service._embed(a)
+    vector_b = cache_service._embed(b)
+    return sum(x * y for x, y in zip(vector_a, vector_b))
+
+
+@pytest.fixture(autouse=True)
+def _fake_redis(monkeypatch):
+    """The PII vault is stored in Redis; swap in an in-process fake server."""
+    server = fakeredis.FakeServer()
+    monkeypatch.setattr(
+        pii_service,
+        "_client",
+        fakeredis.FakeStrictRedis(server=server, decode_responses=True),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _fake_reranker(monkeypatch):
+    monkeypatch.setattr(cache_service, "_reranker", _FakeReranker())
+
+
 @pytest.fixture(autouse=True)
 def _isolated_semantic_cache():
     """Drop cached prompts between tests so hits and misses are deterministic."""
@@ -248,7 +284,7 @@ PII_CASES = [
 def test_pii_scrubber_patterns(raw, tag):
     scrubbed, vault = PIIScrubber.scrub_text(raw)
     assert scrubbed == tag
-    assert vault == {tag: raw}
+    assert vault.load() == {tag: raw}
     assert TAG_RE.fullmatch(scrubbed), f"{scrubbed} is not a {{CATEGORY_N}} token"
 
 
@@ -256,10 +292,19 @@ def test_pii_scrubber_numbers_distinct_values():
     text = "first@enterprise.com and second@enterprise.com"
     scrubbed, vault = PIIScrubber.scrub_text(text)
     assert scrubbed == "{{EMAIL_1}} and {{EMAIL_2}}"
-    assert vault == {
+    assert vault.load() == {
         "{{EMAIL_1}}": "first@enterprise.com",
         "{{EMAIL_2}}": "second@enterprise.com",
     }
+
+
+def test_pii_vault_is_in_redis_and_expires():
+    scrubbed, vault = PIIScrubber.scrub_text(RAW_EMAIL)
+    assert scrubbed == "{{EMAIL_1}}"
+
+    store = pii_service._client
+    assert store.hgetall(vault.key) == {"{{EMAIL_1}}": RAW_EMAIL}
+    assert 0 < store.ttl(vault.key) <= pii_service.VAULT_TTL_SECONDS
 
 
 def test_pii_scrubbed_before_dispatch(client, monkeypatch):
@@ -341,6 +386,41 @@ def test_semantic_cache_hit_miss_and_no_upstream(client, monkeypatch):
     row = _log_after(before)
     assert row["cache_hit"] == 0
     assert row["provider_used"] == "groq"
+
+
+def test_cache_miss_when_reranker_rejects(client, monkeypatch):
+    """A bi-encoder hit the cross-encoder disagrees with must reach the provider."""
+    fake = _FakeClient(answers=[KNOWN_DOCKER_ANSWER, PARIS_ANSWER])
+    _patch_clients(monkeypatch, fake)
+    assert _post(client, PROMPT_A).status_code == 200
+
+    monkeypatch.setattr(
+        cache_service, "_rerank", lambda query, candidates: [0.0] * len(candidates)
+    )
+    response = _post(client, PROMPT_B)
+
+    assert response.json()["choices"][0]["message"]["content"] == PARIS_ANSWER
+    assert len(fake.calls) == 2, "a rejected candidate must not be served"
+
+
+def test_check_cache_reranks_the_top_k_candidates(monkeypatch):
+    # One vector for every prompt, so the bi-encoder ranks both seeds equally
+    # and only the reranker can choose between them.
+    vector = [1.0] + [0.0] * (cache_service._model.get_embedding_dimension() - 1)
+    monkeypatch.setattr(cache_service, "_embed", lambda text: vector)
+    asyncio.run(cache_service.store_cache("alpha prompt", "answer alpha"))
+    asyncio.run(cache_service.store_cache("beta prompt", "answer beta"))
+
+    seen = {}
+
+    def fake_rerank(query, candidates):
+        seen["candidates"] = list(candidates)
+        return [0.99 if "beta" in candidate else 0.01 for candidate in candidates]
+
+    monkeypatch.setattr(cache_service, "_rerank", fake_rerank)
+
+    assert asyncio.run(cache_service.check_cache("alpha prompt")) == "answer beta"
+    assert len(seen["candidates"]) == 2, "every top-K candidate must be reranked"
 
 
 # ------------------------------------------ D. provider dispatch and errors

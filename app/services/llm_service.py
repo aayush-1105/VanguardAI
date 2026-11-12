@@ -12,7 +12,7 @@ from app.api.schemas import ChatCompletionRequest
 from app.core import config
 from app.services import cache_service
 from app.services.log_service import estimate_cost, write_log
-from app.services.pii_service import PIIScrubber
+from app.services.pii_service import PIIScrubber, Vault
 
 logger = logging.getLogger(__name__)
 
@@ -122,13 +122,13 @@ async def _create(
 
 
 def _scrub_messages(messages: list[dict]) -> tuple[list[dict], dict[str, str]]:
-    """Deep copy the messages, tokenize PII in user text, and return the vault."""
+    """Deep copy the messages, tokenize PII in user text, and return the mapping."""
     scrubbed = copy.deepcopy(messages)
-    vault: dict[str, str] = {}
+    vault = Vault()
     for message in scrubbed:
         if message.get("role") == "user" and isinstance(message.get("content"), str):
             message["content"], vault = PIIScrubber.scrub_text(message["content"], vault)
-    return scrubbed, vault
+    return scrubbed, vault.load()
 
 
 def _last_user_text(messages: list[dict]) -> str:
