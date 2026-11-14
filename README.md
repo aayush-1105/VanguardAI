@@ -1,10 +1,10 @@
 # VanguardAI
 
-An OpenAI-compatible LLM gateway that adds the controls an enterprise needs before a prompt leaves the network: reversible PII tokenization, two-stage semantic caching, automatic provider failover, prompt-injection screening, and per-request cost telemetry.
+An OpenAI-compatible LLM gateway that adds the controls an enterprise needs before a prompt leaves the network: reversible PII tokenization, two-stage semantic caching, automatic provider failover, prompt-injection screening, server-side hybrid RAG over your own documents, and per-request cost telemetry.
 
 Point any OpenAI SDK client at `http://localhost:8000/v1` and talk to Groq or OpenRouter without changing application code. Prompts are scrubbed of personal data on the way out, the raw values are restored on the way in, and every request is measured and logged.
 
-VanguardAI v2 moves the gateway out of a single process: the PII vault is shared through Redis with a TTL, the semantic cache is shared through Qdrant, and the whole stack runs from one `docker compose up`.
+VanguardAI v2 moves the gateway out of a single process: the PII vault is shared through Redis with a TTL, the semantic cache and the knowledge base are shared through Qdrant, and the whole stack runs from one `docker compose up`.
 
 ```
 client -> PromptGuard -> PIIScrubber -> semantic cache -> provider -> rehydrate -> client
@@ -41,12 +41,27 @@ The cutoff was calibrated on the real model rather than guessed:
 
 The threshold favours precision deliberately: a missed paraphrase costs one provider call, while a false hit returns another prompt's answer. Only tokenized text is cached, so a hit is rehydrated with the requesting client's own vault.
 
+### Server-Side Hybrid RAG
+
+Upload a document and the gateway answers questions from it without the client assembling any context. `POST /v1/knowledge/ingest` accepts PDF or Markdown, extracts the text, splits it into 500-character chunks with 50 characters of overlap, embeds each chunk with the same `all-MiniLM-L6-v2` model, and stores it in a Qdrant collection (`vanguard_knowledge_base`) together with its filename, timestamp, and chunk index.
+
+A chat request with `"rag_enabled": true` runs hybrid retrieval before dispatch:
+
+1. **Dense:** the 10 nearest chunks by cosine similarity in Qdrant.
+2. **Sparse:** BM25 over the collection, which catches exact identifiers an embedding can blur, such as a launch code.
+3. **Fusion:** Reciprocal Rank Fusion (`k = 60`) merges both rankings, so a chunk that both retrievers rank rises to the top.
+4. **Rerank:** the cross-encoder scores each fused candidate against the question; chunks below `0.05` are dropped and the best 3 are injected as a system message.
+
+Retrieved text is treated as untrusted. It passes through the same PII scrubber as user input, continuing the request's token numbering, so only tokens reach the provider and the caller receives the raw values back. A RAG answer is neither served from nor written to the prompt-keyed semantic cache, because it depends on the knowledge base rather than the prompt alone. If retrieval fails or the knowledge base is empty, the request proceeds without context instead of failing.
+
+Ingestion is bounded: an upload above 10 MB is rejected with `413`, and an empty or unparseable document, including a malformed PDF, returns `400`.
+
 ### Resilience and Testing
 
 - **Failover cascade:** a `429`, any `5xx`, or a connection error retries once on the other provider with the same scrubbed payload. Client errors such as `401` or `404` surface immediately.
 - **Docker Compose:** `api`, `redis`, and `qdrant` start together, wired through `REDIS_URL` and `QDRANT_URL`.
 - **Locust:** `locustfile.py` drives `/v1/chat/completions` for throughput and latency measurements.
-- **32-test end-to-end suite:** runs offline, with providers, Redis (`fakeredis`), and the cross-encoder stubbed. `32 passed in 24.73s`.
+- **43-test end-to-end suite:** runs offline, with providers, Redis (`fakeredis`), and the cross-encoder stubbed. `43 passed in 23.08s`.
 
 ## Architecture
 
@@ -101,10 +116,11 @@ Request lifecycle:
 
 1. `PromptGuard` screens every user message and short-circuits to `403` on a suspected injection.
 2. `PIIScrubber` tokenizes user text and writes the tag-to-raw mapping to Redis under a 300-second TTL.
-3. The tokenized prompt is looked up in Qdrant; the Top-3 candidates are reranked by the cross-encoder. A confirmed hit is rehydrated, logged at zero cost, and returned.
-4. On a miss, the request goes to the routed provider, falling back to the other one on `429`/`5xx`/connection errors.
-5. The response is rehydrated - chunk by chunk with the sliding buffer when streaming - and the tokenized exchange is cached.
-6. Telemetry is written for every request.
+3. With `rag_enabled`, the knowledge base is searched (dense + BM25, fused by RRF, reranked), the surviving chunks are scrubbed into the same vault, and they are prepended as a system message. RAG requests skip the prompt cache.
+4. The tokenized prompt is looked up in Qdrant; the Top-3 candidates are reranked by the cross-encoder. A confirmed hit is rehydrated, logged at zero cost, and returned.
+5. On a miss, the request goes to the routed provider, falling back to the other one on `429`/`5xx`/connection errors.
+6. The response is rehydrated - chunk by chunk with the sliding buffer when streaming - and the tokenized exchange is cached when it was not a RAG request.
+7. Telemetry is written for every request.
 
 ## Sliding-Window Stream Rehydration
 
@@ -173,7 +189,22 @@ curl -N http://localhost:8000/v1/chat/completions \
 
 Model ids are provider-specific and change over time. `openai/gpt-oss-20b` and `openai/gpt-oss-120b` are valid Groq ids today; `llama-3.3-70b-versatile` may be retired on your account. DeepSeek ids such as `deepseek/deepseek-chat` route to OpenRouter.
 
-### 6. Or run the whole stack with Docker
+### 6. Index a document and ask about it
+
+```bash
+curl -s -X POST http://localhost:8000/v1/knowledge/ingest \
+  -F "file=@handbook.pdf"
+# {"filename":"handbook.pdf","chunks_indexed":12}
+
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "openai/gpt-oss-20b", "rag_enabled": true,
+       "messages": [{"role": "user", "content": "What does the handbook say about leave?"}]}'
+```
+
+The knowledge base is shared through `QDRANT_URL`, so every worker sees the same documents.
+
+### 7. Or run the whole stack with Docker
 
 ```bash
 docker compose up --build
@@ -193,24 +224,26 @@ Open `http://localhost:8089`, choose the number of users, and start. The test po
 
 ## Testing
 
-The repository ships a 32-test end-to-end suite powered by pytest. Providers are replaced with fakes, Redis with `fakeredis`, and the cross-encoder is stubbed, so the suite is deterministic, runs offline, and never spends API credits or downloads a second model.
+The repository ships a 43-test end-to-end suite powered by pytest. Providers are replaced with fakes, Redis with `fakeredis`, and the cross-encoder is stubbed, so the suite is deterministic, runs offline, and never spends API credits or downloads a second model.
 
 ```bash
 python -m pytest tests -q
 ```
 
 ```
-32 passed in 24.73s
+43 passed in 23.08s
 ```
 
 Coverage includes PII pattern detection and token numbering, the Redis vault and its TTL, scrub-before-dispatch, cache hit/miss behavior with no upstream call on a hit, cross-encoder rejection and Top-K selection, model routing, upstream error mapping, log persistence, non-stream rehydration, streaming rehydration of tags split across chunk boundaries, the failover cascade on `429`, prompt-injection rejection, cost telemetry (miss charges, hit is free), dashboard queries, and the Locust workload definition.
+
+The RAG tests cover Markdown and PDF ingestion (the PDF is built in memory), the `400`/`413` ingest guardrails, retrieval through both dense search and BM25, RRF fusion, the cross-encoder cutoff and chunk cap, context injection with the cache bypassed, PII scrubbed from retrieved context and rehydrated in the answer, and a RAG SSE stream whose tag is split across chunk boundaries.
 
 ## Project Layout
 
 ```
 app/
   api/
-    routes.py          POST /v1/chat/completions, guardrail, error mapping
+    routes.py          POST /v1/chat/completions, POST /v1/knowledge/ingest, guardrail, error mapping
     schemas.py         ChatCompletionRequest
   core/
     config.py          .env loading and required keys
@@ -218,17 +251,21 @@ app/
     database.py        async SQLAlchemy engine, session factory, table creation
     models.py          RequestLog
   services/
-    llm_service.py     routing, cache integration, rehydration buffer, failover
+    llm_service.py     routing, RAG context injection, cache integration, rehydration, failover
     pii_service.py     PIIScrubber tokenization and Redis vault
     security_service.py PromptGuard
     cache_service.py   Qdrant retrieval, cross-encoder reranking
     log_service.py     telemetry writes and cost estimation
   main.py              application factory and lifespan
+vanguard/
+  rag/
+    ingestion.py       PDF/Markdown extraction, chunking, embedding, upsert
+    retrieval.py       dense + BM25 retrieval, RRF fusion, cross-encoder rerank
 dashboard.py           Streamlit chat UI and telemetry view
 Dockerfile             API image
 docker-compose.yml     api + redis + qdrant
 locustfile.py          load test for /v1/chat/completions
-tests/                 32-test end-to-end suite
+tests/                 43-test end-to-end suite
 requirements.txt
 ```
 
@@ -255,3 +292,6 @@ Tunable constants live next to the code that uses them: `SIMILARITY_THRESHOLD`, 
 - **The injection guard is a heuristic.** It flags the literal phrase "system prompt", so a legitimate question about prompts is rejected as well.
 - **The cache favours precision.** MS MARCO is a query-to-passage reranker, so it under-scores question pairs: a valid paraphrase can miss the cache and reach the provider. A wrong answer is never served in its place.
 - **Failover changes the model.** A DeepSeek request that falls back is answered by the secondary provider's model, which is reflected in the response's `model` field.
+- **The BM25 side of RAG is rebuilt on every query.** It scrolls up to 10,000 chunks and constructs the index in memory, so query cost grows with the corpus; index it once or page it when the knowledge base is large.
+- **Ingested documents are stored verbatim.** PII is tokenized on the way to the provider, for both user prompts and retrieved context, but the Qdrant payload keeps the original document text. Encrypt or redact the collection at ingest time if documents are sensitive at rest.
+- **The prompt cache and RAG do not mix.** A `rag_enabled` request always calls a provider, so it is never cheaper than a cache hit.

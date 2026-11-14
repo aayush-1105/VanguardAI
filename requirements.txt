@@ -10,6 +10,10 @@ streamlit
 requests
 pandas
 redis
+langchain-text-splitters
+pypdf
+rank_bm25
+python-multipart
 pytest
 fakeredis
 locust

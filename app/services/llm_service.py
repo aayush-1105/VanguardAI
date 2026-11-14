@@ -13,6 +13,7 @@ from app.core import config
 from app.services import cache_service
 from app.services.log_service import estimate_cost, write_log
 from app.services.pii_service import PIIScrubber, Vault
+from vanguard.rag.retrieval import retrieve
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,11 @@ GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 # Model ids are provider-specific, so the fallback switches model and endpoint.
 FALLBACK_MODELS = {"groq": "openai/gpt-oss-20b", "openrouter": "deepseek/deepseek-chat"}
+
+RAG_SYSTEM_PROMPT = (
+    "Use the following context to answer the user's question. If the context does "
+    "not contain the answer, say so instead of guessing.\n\n{context}"
+)
 
 # Longest a partial "{{" may be held back before it is emitted unrewritten.
 _MAX_TAG_LOOKAHEAD = 64
@@ -121,14 +127,14 @@ async def _create(
     raise last_error  # type: ignore[misc]
 
 
-def _scrub_messages(messages: list[dict]) -> tuple[list[dict], dict[str, str]]:
-    """Deep copy the messages, tokenize PII in user text, and return the mapping."""
+def _scrub_messages(messages: list[dict]) -> tuple[list[dict], Vault]:
+    """Deep copy the messages and tokenize PII in user text."""
     scrubbed = copy.deepcopy(messages)
     vault = Vault()
     for message in scrubbed:
         if message.get("role") == "user" and isinstance(message.get("content"), str):
             message["content"], vault = PIIScrubber.scrub_text(message["content"], vault)
-    return scrubbed, vault.load()
+    return scrubbed, vault
 
 
 def _last_user_text(messages: list[dict]) -> str:
@@ -192,12 +198,27 @@ async def _cached_stream(answer: str, model: str) -> AsyncIterator[str]:
 async def route_chat_completion(
     request: ChatCompletionRequest,
 ) -> dict[str, Any] | AsyncIterator[str]:
-    """Tokenize PII, check cache, then hit upstream; return a body or an SSE iterator."""
+    """Tokenize PII, optionally add context, check cache, then hit upstream."""
     started = time.perf_counter()
-    messages, vault = _scrub_messages(request.messages)
+    messages, vault_store = _scrub_messages(request.messages)
     prompt = _last_user_text(messages)
 
-    cached = await cache_service.check_cache(prompt) if prompt else None
+    if request.rag_enabled and prompt:
+        context = "\n\n".join(await retrieve(prompt))
+        if context:
+            # Retrieved text is untrusted too: scrub it into the request's vault
+            # so the provider sees tokens while the caller still gets raw values.
+            context, vault_store = PIIScrubber.scrub_text(context, vault_store)
+            messages.insert(
+                0,
+                {"role": "system", "content": RAG_SYSTEM_PROMPT.format(context=context)},
+            )
+    vault = vault_store.load()
+
+    # A RAG answer depends on the knowledge base, not just the prompt, so it is
+    # neither served from nor written to the prompt-keyed cache.
+    cacheable = bool(prompt) and not request.rag_enabled
+    cached = await cache_service.check_cache(prompt) if cacheable else None
     if cached is not None:
         answer = _rehydrate_text(cached, vault)
         await write_log(
@@ -213,7 +234,9 @@ async def route_chat_completion(
     upstream, client, provider = await _create(request.model, messages, request.stream)
 
     if request.stream:
-        return _stream(upstream, client, prompt, provider, started, vault, request.model)
+        return _stream(
+            upstream, client, prompt, provider, started, vault, request.model, cacheable
+        )
 
     try:
         body = upstream.model_dump()
@@ -223,7 +246,7 @@ async def route_chat_completion(
     raw_answer = _content_of(body)
     if raw_answer:
         body["choices"][0]["message"]["content"] = _rehydrate_text(raw_answer, vault)
-    if prompt and raw_answer:
+    if cacheable and raw_answer:
         # Only the tokenized text is cached, so later requests rehydrate with
         # their own vault instead of leaking this caller's raw values.
         await cache_service.store_cache(prompt, raw_answer)
@@ -244,6 +267,7 @@ async def _stream(
     started: float,
     vault: dict[str, str],
     model: str,
+    cacheable: bool,
 ) -> AsyncIterator[str]:
     rehydrator = Rehydrator(vault)
     parts: list[str] = []
@@ -278,7 +302,7 @@ async def _stream(
     yield "data: [DONE]\n\n"
 
     raw_answer = "".join(parts)
-    if prompt and raw_answer:
+    if cacheable and raw_answer:
         await cache_service.store_cache(prompt, raw_answer)
     await write_log(
         provider_used=provider,
