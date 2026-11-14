@@ -30,6 +30,7 @@ from app.services import cache_service, llm_service, pii_service
 from app.services.pii_service import PIIScrubber
 from vanguard.rag import retrieval
 from vanguard.rag.ingestion import KNOWLEDGE_COLLECTION
+from vanguard.routing import circuit_breaker
 
 ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT / "vanguard.db"
@@ -219,6 +220,15 @@ def _isolated_semantic_cache():
         ),
     )
     yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_circuit_breaker(monkeypatch):
+    """Keep circuit state process-local and empty so failover tests cannot leak."""
+    monkeypatch.setattr(circuit_breaker, "_client", None)
+    circuit_breaker.reset()
+    yield
+    circuit_breaker.reset()
 
 
 def _patch_clients(monkeypatch, clients):
@@ -976,3 +986,150 @@ def test_rag_stream_delivers_chunks_and_rehydrates_split_tags(client, monkeypatc
     assert _stream_text(response) == f"Write to {CONTACT_EMAIL} for launch support."
     assert fake.calls[0]["stream"] is True
     assert "{{EMAIL_1}}" in fake.calls[0]["messages"][0]["content"]
+
+
+# ------------------------------------------------ K. circuit breaker
+
+
+# Distinct topics so no request can be served from the semantic cache and
+# silently skip the provider path this suite is exercising.
+CIRCUIT_PROMPTS = [
+    "Explain the CAP theorem in distributed systems.",
+    "How do vector clocks detect concurrent updates?",
+    "Describe how Raft elects a leader.",
+    "What does the BGP path selection algorithm prefer?",
+    "Summarize the difference between TCP and UDP.",
+    "What is a Merkle tree used for?",
+]
+
+
+def _trip_primary(client, primary, secondary):
+    for prompt in CIRCUIT_PROMPTS:
+        assert _post(client, prompt).status_code == 200
+        if circuit_breaker.state_of("groq") == circuit_breaker.OPEN:
+            return
+    raise AssertionError("the primary circuit never tripped")
+
+
+def test_circuit_trips_open_and_bypasses_primary(client, monkeypatch):
+    primary = _FakeClient(error=_api_status_error(503))
+    secondary = _FakeClient(answers=["served by the fallback"] * 6)
+    _patch_clients(monkeypatch, {"groq": primary, "openrouter": secondary})
+
+    _trip_primary(client, primary, secondary)
+    assert circuit_breaker.state_of("groq") == circuit_breaker.OPEN
+    tripped_calls = len(primary.calls)
+
+    response = _post(client, "What is a quorum in distributed consensus?")
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "served by the fallback"
+    assert len(primary.calls) == tripped_calls, "an open circuit still dialled the provider"
+    assert len(secondary.calls) == tripped_calls + 1
+
+
+def test_all_circuits_open_returns_503(client, monkeypatch):
+    primary = _FakeClient(error=_api_status_error(500))
+    secondary = _FakeClient(error=_api_status_error(500))
+    _patch_clients(monkeypatch, {"groq": primary, "openrouter": secondary})
+
+    # Both providers fail on every attempt, so both trip at the same threshold.
+    for prompt in CIRCUIT_PROMPTS[: circuit_breaker.FAILURE_THRESHOLD]:
+        assert _post(client, prompt).status_code == 500
+    assert circuit_breaker.state_of("groq") == circuit_breaker.OPEN
+    assert circuit_breaker.state_of("openrouter") == circuit_breaker.OPEN
+
+    calls = (len(primary.calls), len(secondary.calls))
+    response = _post(client, "What is the Raft commit index?")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["type"] == "circuit_open"
+    assert (len(primary.calls), len(secondary.calls)) == calls, (
+        "all-open must fail fast without any upstream call"
+    )
+
+
+def test_half_open_probe_failure_reopens(client, monkeypatch):
+    primary = _FakeClient(error=_api_status_error(500))
+    secondary = _FakeClient(answers=["served by the fallback"] * 8)
+    _patch_clients(monkeypatch, {"groq": primary, "openrouter": secondary})
+
+    clock = {"now": 1_000_000.0}
+    monkeypatch.setattr(circuit_breaker, "_now", lambda: clock["now"])
+
+    _trip_primary(client, primary, secondary)
+    assert len(primary.calls) == circuit_breaker.FAILURE_THRESHOLD
+
+    # Still inside the cooldown: no probe.
+    clock["now"] += circuit_breaker.RECOVERY_TIMEOUT - 1
+    assert _post(client, "How does a bloom filter work?").status_code == 200
+    assert len(primary.calls) == circuit_breaker.FAILURE_THRESHOLD
+
+    # Cooldown elapsed: exactly one probe is let through, and it fails.
+    clock["now"] += 2
+    assert _post(client, "What is consistent hashing?").status_code == 200
+    assert len(primary.calls) == circuit_breaker.FAILURE_THRESHOLD + 1
+    assert circuit_breaker.state_of("groq") == circuit_breaker.OPEN
+
+    # The failed probe restarted the cooldown; no second probe yet.
+    assert _post(client, "What is a write-ahead log?").status_code == 200
+    assert len(primary.calls) == circuit_breaker.FAILURE_THRESHOLD + 1
+
+
+def test_half_open_probe_success_closes_circuit(client, monkeypatch):
+    providers = {
+        "groq": _FakeClient(error=_api_status_error(500)),
+        "openrouter": _FakeClient(answers=["served by the fallback"] * 8),
+    }
+    _patch_clients(monkeypatch, providers)
+    secondary = providers["openrouter"]
+
+    clock = {"now": 1_000_000.0}
+    monkeypatch.setattr(circuit_breaker, "_now", lambda: clock["now"])
+
+    _trip_primary(client, providers["groq"], secondary)
+    assert circuit_breaker.state_of("groq") == circuit_breaker.OPEN
+    fallback_calls = len(secondary.calls)
+
+    healthy = _FakeClient(answers=["the primary is back", "and stays back"])
+    providers["groq"] = healthy
+    clock["now"] += circuit_breaker.RECOVERY_TIMEOUT + 1
+
+    probe = _post(client, "What is idempotency in distributed systems?")
+
+    assert probe.status_code == 200
+    assert probe.json()["choices"][0]["message"]["content"] == "the primary is back"
+    assert len(healthy.calls) == 1, "the probe did not reach the recovering provider"
+    assert circuit_breaker.state_of("groq") == circuit_breaker.CLOSED
+
+    # Normal routing is restored: the next request skips the fallback.
+    follow_up = _post(client, "Why is clock skew dangerous?")
+    assert follow_up.json()["choices"][0]["message"]["content"] == "and stays back"
+    assert len(healthy.calls) == 2
+    assert len(secondary.calls) == fallback_calls
+
+
+def test_success_resets_consecutive_failure_count():
+    circuit_breaker.record_failure("groq")
+    circuit_breaker.record_failure("groq")
+    circuit_breaker.record_success("groq")
+    circuit_breaker.record_failure("groq")
+    circuit_breaker.record_failure("groq")
+
+    assert circuit_breaker.state_of("groq") == circuit_breaker.CLOSED
+
+
+def test_circuit_state_is_shared_through_redis(monkeypatch):
+    store = fakeredis.FakeStrictRedis(decode_responses=True)
+    monkeypatch.setattr(circuit_breaker, "_client", store)
+
+    for _ in range(circuit_breaker.FAILURE_THRESHOLD):
+        circuit_breaker.record_failure("groq")
+    assert store.hgetall("vanguard:circuit:groq")["state"] == circuit_breaker.OPEN
+
+    # A second worker sees the trip even with no local memory of it.
+    circuit_breaker._memory.clear()
+    assert circuit_breaker.allow("groq") is False
+
+    circuit_breaker.reset()
+    assert store.hgetall("vanguard:circuit:groq") == {}

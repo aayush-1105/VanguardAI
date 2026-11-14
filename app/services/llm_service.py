@@ -14,6 +14,8 @@ from app.services import cache_service
 from app.services.log_service import estimate_cost, write_log
 from app.services.pii_service import PIIScrubber, Vault
 from vanguard.rag.retrieval import retrieve
+from vanguard.routing import circuit_breaker
+from vanguard.routing.circuit_breaker import AllProvidersOpen
 
 logger = logging.getLogger(__name__)
 
@@ -105,25 +107,41 @@ def _is_fallback_worthy(exc: Exception) -> bool:
 async def _create(
     model: str, messages: list[dict], stream: bool
 ) -> tuple[AsyncIterator[Any], AsyncOpenAI, str]:
-    """Call the primary provider, retrying once on the secondary if it fails."""
+    """Call the primary provider, retrying once on the secondary if it fails.
+
+    A provider whose circuit is open is skipped without a network call.
+    """
     primary = _provider_for(model)
     secondary = _other_provider(primary)
     attempts = [(primary, model), (secondary, FALLBACK_MODELS[secondary])]
 
     last_error: Exception | None = None
+    attempted = False
     for provider, candidate_model in attempts:
+        if not circuit_breaker.allow(provider):
+            logger.warning("circuit open for %s; skipping", provider)
+            continue
+        attempted = True
         client = _client(provider)
         try:
             upstream = await client.chat.completions.create(
                 model=candidate_model, messages=messages, stream=stream
             )
+            circuit_breaker.record_success(provider)
             return upstream, client, provider
         except (APIStatusError, APIConnectionError) as exc:
             await client.close()
             if not _is_fallback_worthy(exc):
+                # The provider is reachable and merely refused this request, so
+                # it counts as healthy for circuit purposes.
+                circuit_breaker.record_success(provider)
                 raise
+            circuit_breaker.record_failure(provider)
             logger.warning("provider %s failed (%s); retrying on %s", provider, exc, secondary)
             last_error = exc
+
+    if not attempted:
+        raise AllProvidersOpen("All providers are circuit-open; no upstream was called.")
     raise last_error  # type: ignore[misc]
 
 

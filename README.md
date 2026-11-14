@@ -56,12 +56,24 @@ Retrieved text is treated as untrusted. It passes through the same PII scrubber 
 
 Ingestion is bounded: an upload above 10 MB is rejected with `413`, and an empty or unparseable document, including a malformed PDF, returns `400`.
 
+### Per-Provider Circuit Breaker
+
+Failover alone still pays the latency of a dead provider on every request. Each provider now has a three-state circuit breaker (`vanguard/routing/circuit_breaker.py`):
+
+- **Closed (normal):** requests route as usual. Connection errors, timeouts, `429`s, and `5xx`s increment a consecutive-failure counter; any successful response resets it to `0`.
+- **Open (tripped):** after `FAILURE_THRESHOLD = 3` consecutive failures the circuit trips. Requests skip that provider entirely - no connection attempt, no timeout - and go straight to the healthy one for a `RECOVERY_TIMEOUT = 30.0` second cooldown.
+- **Half-Open (probe):** once the cooldown expires, exactly one probe request is admitted. If it succeeds, the circuit returns to Closed and normal routing resumes; if it fails, the circuit trips back to Open and the cooldown restarts.
+
+Circuit state is stored in Redis as `vanguard:circuit:<provider>` so every worker sees the same trip, with the same fallback as the PII vault: if Redis is unreachable, the state lives in this process instead. Tests clear it with `circuit_breaker.reset()`.
+
+When every provider is open, the gateway answers `503 Service Unavailable` with `"type": "circuit_open"` immediately, without attempting any upstream call - a dead dependency costs no time.
+
 ### Resilience and Testing
 
-- **Failover cascade:** a `429`, any `5xx`, or a connection error retries once on the other provider with the same scrubbed payload. Client errors such as `401` or `404` surface immediately.
+- **Failover cascade:** a `429`, any `5xx`, or a connection error retries once on the other provider with the same scrubbed payload. Client errors such as `401` or `404` surface immediately and count as the provider being reachable, not as a failure against its circuit.
 - **Docker Compose:** `api`, `redis`, and `qdrant` start together, wired through `REDIS_URL` and `QDRANT_URL`.
 - **Locust:** `locustfile.py` drives `/v1/chat/completions` for throughput and latency measurements.
-- **43-test end-to-end suite:** runs offline, with providers, Redis (`fakeredis`), and the cross-encoder stubbed. `43 passed in 23.08s`.
+- **49-test end-to-end suite:** runs offline, with providers, Redis (`fakeredis`), and the cross-encoder stubbed. `49 passed in 23.30s`.
 
 ## Architecture
 
@@ -94,6 +106,12 @@ Ingestion is bounded: an upload above 10 MB is rejected with `413`, and an empty
   +-----------+-----------+
               |  miss
               v
+  +-----------------------+        open -> skip, no network call
+  |  Circuit breaker      |
+  |  per provider         |
+  +-----------+-----------+
+              |  closed, or one half-open probe
+              v
   +-----------------------+        Groq  <--failover-->  OpenRouter
   |  Provider call        |
   +-----------+-----------+
@@ -118,7 +136,7 @@ Request lifecycle:
 2. `PIIScrubber` tokenizes user text and writes the tag-to-raw mapping to Redis under a 300-second TTL.
 3. With `rag_enabled`, the knowledge base is searched (dense + BM25, fused by RRF, reranked), the surviving chunks are scrubbed into the same vault, and they are prepended as a system message. RAG requests skip the prompt cache.
 4. The tokenized prompt is looked up in Qdrant; the Top-3 candidates are reranked by the cross-encoder. A confirmed hit is rehydrated, logged at zero cost, and returned.
-5. On a miss, the request goes to the routed provider, falling back to the other one on `429`/`5xx`/connection errors.
+5. On a miss, the request goes to the routed provider unless its circuit is open, in which case that provider is skipped without a network call. A `429`/`5xx`/connection failure falls back to the other provider and counts against the failing one's circuit.
 6. The response is rehydrated - chunk by chunk with the sliding buffer when streaming - and the tokenized exchange is cached when it was not a RAG request.
 7. Telemetry is written for every request.
 
@@ -224,17 +242,17 @@ Open `http://localhost:8089`, choose the number of users, and start. The test po
 
 ## Testing
 
-The repository ships a 43-test end-to-end suite powered by pytest. Providers are replaced with fakes, Redis with `fakeredis`, and the cross-encoder is stubbed, so the suite is deterministic, runs offline, and never spends API credits or downloads a second model.
+The repository ships a 49-test end-to-end suite powered by pytest. Providers are replaced with fakes, Redis with `fakeredis`, and the cross-encoder is stubbed, so the suite is deterministic, runs offline, and never spends API credits or downloads a second model.
 
 ```bash
 python -m pytest tests -q
 ```
 
 ```
-43 passed in 23.08s
+49 passed in 23.30s
 ```
 
-Coverage includes PII pattern detection and token numbering, the Redis vault and its TTL, scrub-before-dispatch, cache hit/miss behavior with no upstream call on a hit, cross-encoder rejection and Top-K selection, model routing, upstream error mapping, log persistence, non-stream rehydration, streaming rehydration of tags split across chunk boundaries, the failover cascade on `429`, prompt-injection rejection, cost telemetry (miss charges, hit is free), dashboard queries, and the Locust workload definition.
+Coverage includes PII pattern detection and token numbering, the Redis vault and its TTL, scrub-before-dispatch, cache hit/miss behavior with no upstream call on a hit, cross-encoder rejection and Top-K selection, model routing, upstream error mapping, log persistence, non-stream rehydration, streaming rehydration of tags split across chunk boundaries, the failover cascade on `429`, prompt-injection rejection, cost telemetry (miss charges, hit is free), dashboard queries, the Locust workload definition, and the circuit breaker: trip-and-bypass, all-open fail-fast `503`, half-open probe failure and recovery, success resetting the failure count, and state shared through Redis.
 
 The RAG tests cover Markdown and PDF ingestion (the PDF is built in memory), the `400`/`413` ingest guardrails, retrieval through both dense search and BM25, RRF fusion, the cross-encoder cutoff and chunk cap, context injection with the cache bypassed, PII scrubbed from retrieved context and rehydrated in the answer, and a RAG SSE stream whose tag is split across chunk boundaries.
 
@@ -265,7 +283,7 @@ dashboard.py           Streamlit chat UI and telemetry view
 Dockerfile             API image
 docker-compose.yml     api + redis + qdrant
 locustfile.py          load test for /v1/chat/completions
-tests/                 43-test end-to-end suite
+tests/                 49-test end-to-end suite
 requirements.txt
 ```
 
@@ -281,7 +299,7 @@ Runtime artifacts: `vanguard.db` (SQLite telemetry), created on first start. It 
 | `REDIS_URL` | no | PII vault store; defaults to `redis://localhost:6379/0` |
 | `QDRANT_URL` | no | Remote Qdrant; defaults to an in-memory collection |
 
-Tunable constants live next to the code that uses them: `SIMILARITY_THRESHOLD`, `CROSS_ENCODER_THRESHOLD`, and `RERANK_CANDIDATES` in `app/services/cache_service.py`, `VAULT_TTL_SECONDS` in `app/services/pii_service.py`, `FALLBACK_MODELS` in `app/services/llm_service.py`, pricing in `app/services/log_service.py`, and the guard patterns in `app/services/security_service.py`.
+Tunable constants live next to the code that uses them: `SIMILARITY_THRESHOLD`, `CROSS_ENCODER_THRESHOLD`, and `RERANK_CANDIDATES` in `app/services/cache_service.py`, `VAULT_TTL_SECONDS` in `app/services/pii_service.py`, `FALLBACK_MODELS` in `app/services/llm_service.py`, `FAILURE_THRESHOLD` and `RECOVERY_TIMEOUT` in `vanguard/routing/circuit_breaker.py`, pricing in `app/services/log_service.py`, and the guard patterns in `app/services/security_service.py`.
 
 ## Known Limitations
 
@@ -291,6 +309,7 @@ Tunable constants live next to the code that uses them: `SIMILARITY_THRESHOLD`, 
 - **Cost is an estimate.** Prices are derived from character counts at 4 characters per token, using a flat rate, rather than from provider-reported usage.
 - **The injection guard is a heuristic.** It flags the literal phrase "system prompt", so a legitimate question about prompts is rejected as well.
 - **The cache favours precision.** MS MARCO is a query-to-passage reranker, so it under-scores question pairs: a valid paraphrase can miss the cache and reach the provider. A wrong answer is never served in its place.
+- **Circuit state degrades to process-local without Redis.** Each worker then trips its own circuit, so recovery is per worker until Redis returns.
 - **Failover changes the model.** A DeepSeek request that falls back is answered by the secondary provider's model, which is reflected in the response's `model` field.
 - **The BM25 side of RAG is rebuilt on every query.** It scrolls up to 10,000 chunks and constructs the index in memory, so query cost grows with the corpus; index it once or page it when the knowledge base is large.
 - **Ingested documents are stored verbatim.** PII is tokenized on the way to the provider, for both user prompts and retrieved context, but the Qdrant payload keeps the original document text. Encrypt or redact the collection at ingest time if documents are sensitive at rest.

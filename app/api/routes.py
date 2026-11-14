@@ -10,6 +10,7 @@ from app.api.schemas import ChatCompletionRequest
 from app.services.llm_service import route_chat_completion
 from app.services.security_service import PromptGuard
 from vanguard.rag.ingestion import ingest_document
+from vanguard.routing.circuit_breaker import AllProvidersOpen
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,12 @@ async def chat_completions(request: ChatCompletionRequest):
 
     try:
         result = await route_chat_completion(request)
+    except AllProvidersOpen as exc:
+        # Fail fast: every circuit is open, so no provider was dialled.
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": str(exc), "type": "circuit_open"}},
+        )
     except (openai.APIStatusError, openai.APIConnectionError) as exc:
         # Connection failures have no upstream status, so fall back to Bad Gateway.
         status = getattr(exc, "status_code", None) or 502
