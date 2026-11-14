@@ -30,7 +30,7 @@ from app.services import cache_service, llm_service, pii_service
 from app.services.pii_service import PIIScrubber
 from vanguard.rag import retrieval
 from vanguard.rag.ingestion import KNOWLEDGE_COLLECTION
-from vanguard.routing import circuit_breaker
+from vanguard.routing import circuit_breaker, discovery, providers
 
 ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT / "vanguard.db"
@@ -229,6 +229,19 @@ def _isolated_circuit_breaker(monkeypatch):
     circuit_breaker.reset()
     yield
     circuit_breaker.reset()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_provider_config(tmp_path, monkeypatch):
+    """Each test gets a fresh provider config and discovery cache."""
+    monkeypatch.setattr(providers, "CONFIG_PATH", tmp_path / "vanguard_config.json")
+    monkeypatch.setattr(discovery, "_client", None)
+    monkeypatch.setattr(discovery, "_transport", None)
+    providers.reset_config()
+    discovery.reset_catalog()
+    yield
+    providers.reset_config()
+    discovery.reset_catalog()
 
 
 def _patch_clients(monkeypatch, clients):
@@ -584,9 +597,11 @@ def test_cross_encoder_threshold_is_enforced(monkeypatch):
 
 
 def test_model_routing():
-    assert llm_service._provider_for("deepseek/deepseek-chat") == "openrouter"
-    assert llm_service._provider_for("DeepSeek-R1") == "openrouter"
+    # An explicit "<provider>/<model>" wins over the default route.
+    assert llm_service._provider_for("deepseek/deepseek-chat") == "deepseek"
+    # A slash that is not a provider prefix, or no slash at all, uses the default.
     assert llm_service._provider_for("openai/gpt-oss-20b") == "groq"
+    assert llm_service._provider_for("DeepSeek-R1") == "groq"
     assert llm_service._provider_for("llama-3.1-8b-instant") == "groq"
 
 
@@ -703,7 +718,7 @@ def test_fallback_cascade_on_429(client, monkeypatch):
     )
     assert len(primary.calls) == 1
     assert len(secondary.calls) == 1
-    assert secondary.calls[0]["model"] == llm_service.FALLBACK_MODELS["openrouter"]
+    assert secondary.calls[0]["model"] == "deepseek/deepseek-chat"
 
     row = _log_after(before)
     assert row["provider_used"] == "openrouter"
@@ -1133,3 +1148,232 @@ def test_circuit_state_is_shared_through_redis(monkeypatch):
 
     circuit_breaker.reset()
     assert store.hgetall("vanguard:circuit:groq") == {}
+
+
+# --------------------------------------- L. multi-provider routing and discovery
+
+
+def _set_routing(default_model, aliases=None, fallbacks=None):
+    providers.update_routing(
+        {
+            "default_model": default_model,
+            "alias_overrides": {name: None for name in providers.ALIAS_NAMES} | (aliases or {}),
+            "fallback_models": list(fallbacks or []),
+        }
+    )
+
+
+def test_builtin_provider_catalog_covers_cloud_and_local():
+    known = providers.list_providers()
+    assert known["groq"]["base_url"] == "https://api.groq.com/openai/v1"
+    assert known["nvidia_nim"]["base_url"] == "https://integrate.api.nvidia.com/v1"
+    assert known["gemini"]["base_url"] == (
+        "https://generativelanguage.googleapis.com/v1beta/openai"
+    )
+    assert known["ollama"]["category"] == "local"
+    assert known["ollama"]["base_url"] == "http://localhost:11434/v1"
+    assert known["lmstudio"]["base_url"] == "http://localhost:1234/v1"
+    assert known["llamacpp"]["base_url"] == "http://localhost:8080/v1"
+
+
+def test_config_seeds_enabled_providers_and_default_route():
+    config = providers.load_config()
+    assert config["routing"]["default_model"] == "groq/openai/gpt-oss-20b"
+    assert config["routing"]["fallback_models"] == ["openrouter/deepseek/deepseek-chat"]
+    assert config["providers"]["groq"]["enabled"] is True
+    assert config["providers"]["openrouter"]["enabled"] is True
+    assert config["providers"]["ollama"]["enabled"] is False
+
+    # The seed was written, so the next process reads the same configuration.
+    written = json.loads(providers.CONFIG_PATH.read_text(encoding="utf-8"))
+    assert written["routing"]["default_model"] == "groq/openai/gpt-oss-20b"
+
+
+def test_provider_crud_masks_keys_and_persists(client):
+    secret = "sk-acme-0123456789"
+    response = client.post(
+        "/v1/admin/providers",
+        json={
+            "id": "acme",
+            "name": "Acme Cloud",
+            "category": "custom",
+            "base_url": "https://llm.acme.test/v1",
+            "api_key": secret,
+            "enabled": True,
+        },
+    )
+    assert response.status_code == 200
+    assert secret not in response.text
+
+    listing = client.get("/v1/admin/providers")
+    assert listing.status_code == 200
+    assert secret not in listing.text
+    acme = next(p for p in listing.json()["providers"] if p["id"] == "acme")
+    assert acme["enabled"] is True
+    assert acme["has_api_key"] is True
+    assert acme["api_key"] == "sk-a...6789"
+
+    # The raw key survives a reload; only the API response is masked.
+    providers.reset_config()
+    stored = providers.get_provider("acme")
+    assert stored["api_key"] == secret
+    assert stored["base_url"] == "https://llm.acme.test/v1"
+
+    # Omitting api_key updates the rest without losing the stored secret.
+    client.post("/v1/admin/providers", json={"id": "acme", "enabled": False})
+    assert providers.get_provider("acme")["api_key"] == secret
+    assert providers.get_provider("acme")["enabled"] is False
+
+    bad = client.post(
+        "/v1/admin/providers",
+        json={"id": "acme", "base_url": "ftp://not-http"},
+    )
+    assert bad.status_code == 400
+
+
+def test_model_discovery_tolerates_an_unreachable_provider(client, monkeypatch):
+    providers.upsert_provider({**providers.get_provider("ollama"), "enabled": True})
+    providers.upsert_provider({**providers.get_provider("groq"), "enabled": True})
+    providers.upsert_provider({**providers.get_provider("openrouter"), "enabled": True})
+
+    def handler(request):
+        host = request.url.host
+        if host == "api.groq.com":
+            return httpx.Response(
+                200,
+                request=request,
+                json={"data": [{"id": "llama-3.3-70b-versatile"}, {"id": "openai/gpt-oss-20b"}]},
+            )
+        if host == "openrouter.ai":
+            return httpx.Response(
+                200, request=request, json={"data": [{"id": "deepseek/deepseek-chat"}]}
+            )
+        raise httpx.ConnectTimeout("provider did not answer")
+
+    monkeypatch.setattr(discovery, "_transport", httpx.MockTransport(handler))
+
+    response = client.post("/v1/admin/models/refresh")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["providers"]["groq"]["status"] == "ok"
+    assert body["providers"]["groq"]["model_count"] == 2
+    assert body["providers"]["ollama"]["status"] == "unreachable"
+    assert body["providers"]["ollama"]["model_count"] == 0
+
+    ids = {entry["id"] for entry in body["data"]}
+    assert "groq/llama-3.3-70b-versatile" in ids
+    assert "openrouter/deepseek/deepseek-chat" in ids
+    assert not any(model_id.startswith("ollama/") for model_id in ids)
+
+    listing = client.get("/v1/models").json()
+    assert listing["object"] == "list"
+    assert listing["data"] == body["data"]
+
+
+def test_explicit_provider_prefix_is_stripped_before_dispatch(client, monkeypatch):
+    groq = _FakeClient(answers=["primary"])
+    openrouter = _FakeClient(answers=["explicit"])
+    _patch_clients(monkeypatch, {"groq": groq, "openrouter": openrouter})
+
+    response = _post(
+        client,
+        "Why does TCP need a three-way handshake?",
+        model="openrouter/meta/llama-3.1-70b-instruct",
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "explicit"
+    assert openrouter.calls[0]["model"] == "meta/llama-3.1-70b-instruct"
+    assert groq.calls == []
+
+
+def test_alias_and_default_resolution(client, monkeypatch):
+    _set_routing(
+        "groq/openai/gpt-oss-20b",
+        aliases={"fast": "openrouter/meta/llama-3.1-8b-instruct"},
+    )
+    groq = _FakeClient(answers=["served by the default"])
+    openrouter = _FakeClient(answers=["served by the alias"])
+    _patch_clients(monkeypatch, {"groq": groq, "openrouter": openrouter})
+
+    alias_response = _post(client, "Explain the CAP theorem.", model="fast")
+    assert alias_response.json()["choices"][0]["message"]["content"] == "served by the alias"
+    assert openrouter.calls[0]["model"] == "meta/llama-3.1-8b-instruct"
+
+    default_response = _post(client, "What is a vector clock?", model="some-unmapped-model")
+    assert (
+        default_response.json()["choices"][0]["message"]["content"]
+        == "served by the default"
+    )
+    assert groq.calls[0]["model"] == "openai/gpt-oss-20b"
+
+
+def test_ordered_fallback_chain_crosses_providers(client, monkeypatch):
+    providers.upsert_provider({**providers.get_provider("nvidia_nim"), "enabled": True})
+    _set_routing(
+        "groq/openai/gpt-oss-20b",
+        fallbacks=[
+            "openrouter/deepseek/deepseek-chat",
+            "nvidia_nim/meta/llama-3.1-70b-instruct",
+        ],
+    )
+    groq = _FakeClient(error=_api_status_error(429))
+    openrouter = _FakeClient(error=_api_status_error(503))
+    nim = _FakeClient(answers=["served by the third hop"])
+    _patch_clients(monkeypatch, {"groq": groq, "openrouter": openrouter, "nvidia_nim": nim})
+
+    response = _post(client, "What does the two-phase commit protocol guarantee?")
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "served by the third hop"
+    assert [call["model"] for call in groq.calls] == ["openai/gpt-oss-20b"]
+    assert [call["model"] for call in openrouter.calls] == ["deepseek/deepseek-chat"]
+    assert [call["model"] for call in nim.calls] == ["meta/llama-3.1-70b-instruct"]
+
+
+def test_same_provider_fallback_uses_the_next_model(client, monkeypatch):
+    _set_routing(
+        "groq/openai/gpt-oss-20b",
+        fallbacks=["groq/llama-3.1-8b-instant"],
+    )
+    groq = _FakeClient(error=_api_status_error(500))
+    _patch_clients(monkeypatch, {"groq": groq})
+
+    response = _post(client, "Why is a monotonic clock needed for leases?")
+
+    assert response.status_code == 500
+    assert [call["model"] for call in groq.calls] == [
+        "openai/gpt-oss-20b",
+        "llama-3.1-8b-instant",
+    ]
+
+
+def test_routing_endpoint_persists_and_rejects_unknown_providers(client):
+    payload = {
+        "default_model": "openrouter/deepseek/deepseek-chat",
+        "alias_overrides": {"coding": "groq/llama-3.3-70b-versatile"},
+        "fallback_models": ["groq/openai/gpt-oss-20b"],
+    }
+    response = client.post("/v1/admin/routing", json=payload)
+    assert response.status_code == 200
+    assert response.json()["default_model"] == "openrouter/deepseek/deepseek-chat"
+
+    current = client.get("/v1/admin/routing").json()
+    assert current["alias_overrides"]["coding"] == "groq/llama-3.3-70b-versatile"
+    assert current["fallback_models"] == ["groq/openai/gpt-oss-20b"]
+
+    bad_default = client.post("/v1/admin/routing", json={"default_model": "nope/model"})
+    assert bad_default.status_code == 400
+    bad_alias = client.post(
+        "/v1/admin/routing",
+        json={"default_model": "groq/openai/gpt-oss-20b", "alias_overrides": {"turbo": None}},
+    )
+    assert bad_alias.status_code == 400
+
+
+def test_control_panel_serves_html(client):
+    response = client.get("/ui")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "<title>VanguardAI Control Panel</title>" in response.text
+    assert "Model Config" in response.text

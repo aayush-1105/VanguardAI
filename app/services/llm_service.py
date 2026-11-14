@@ -9,21 +9,14 @@ from uuid import uuid4
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI
 
 from app.api.schemas import ChatCompletionRequest
-from app.core import config
 from app.services import cache_service
 from app.services.log_service import estimate_cost, write_log
 from app.services.pii_service import PIIScrubber, Vault
 from vanguard.rag.retrieval import retrieve
-from vanguard.routing import circuit_breaker
+from vanguard.routing import circuit_breaker, providers, router as model_router
 from vanguard.routing.circuit_breaker import AllProvidersOpen
 
 logger = logging.getLogger(__name__)
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-
-# Model ids are provider-specific, so the fallback switches model and endpoint.
-FALLBACK_MODELS = {"groq": "openai/gpt-oss-20b", "openrouter": "deepseek/deepseek-chat"}
 
 RAG_SYSTEM_PROMPT = (
     "Use the following context to answer the user's question. If the context does "
@@ -80,22 +73,22 @@ def _rehydrate_text(text: str, vault: dict[str, str]) -> str:
 
 
 def _provider_for(model: str) -> str:
-    return "openrouter" if "deepseek" in model.lower() else "groq"
-
-
-def _other_provider(provider: str) -> str:
-    return "groq" if provider == "openrouter" else "openrouter"
-
-
-def _credentials(provider: str) -> tuple[str, str]:
-    if provider == "openrouter":
-        return OPENROUTER_BASE_URL, config.OPENROUTER_API_KEY
-    return GROQ_BASE_URL, config.GROQ_API_KEY
+    """The provider the primary hop would use for this model id."""
+    target = model_router.resolve(model)
+    if target is None:
+        raise AllProvidersOpen("No default model is configured.")
+    return target[0]
 
 
 def _client(provider: str) -> AsyncOpenAI:
-    base_url, api_key = _credentials(provider)
-    return AsyncOpenAI(base_url=base_url, api_key=api_key)
+    entry = providers.get_provider(provider)
+    if entry is None:
+        raise ValueError(f"Unknown provider {provider!r}")
+    return AsyncOpenAI(
+        base_url=entry["base_url"],
+        # Local OpenAI-compatible servers reject a missing key but ignore its value.
+        api_key=entry.get("api_key") or "not-needed",
+    )
 
 
 def _is_fallback_worthy(exc: Exception) -> bool:
@@ -107,17 +100,18 @@ def _is_fallback_worthy(exc: Exception) -> bool:
 async def _create(
     model: str, messages: list[dict], stream: bool
 ) -> tuple[AsyncIterator[Any], AsyncOpenAI, str]:
-    """Call the primary provider, retrying once on the secondary if it fails.
+    """Walk the configured candidate chain until a provider answers.
 
-    A provider whose circuit is open is skipped without a network call.
+    A provider whose circuit is open is skipped without a network call, and a
+    fallback-worthy failure moves to the next hop with that hop's own model id.
     """
-    primary = _provider_for(model)
-    secondary = _other_provider(primary)
-    attempts = [(primary, model), (secondary, FALLBACK_MODELS[secondary])]
+    chain = model_router.candidates(model)
+    if not chain:
+        raise AllProvidersOpen("No model is configured; set a default model in /ui.")
 
     last_error: Exception | None = None
     attempted = False
-    for provider, candidate_model in attempts:
+    for provider, candidate_model in chain:
         if not circuit_breaker.allow(provider):
             logger.warning("circuit open for %s; skipping", provider)
             continue
@@ -137,7 +131,7 @@ async def _create(
                 circuit_breaker.record_success(provider)
                 raise
             circuit_breaker.record_failure(provider)
-            logger.warning("provider %s failed (%s); retrying on %s", provider, exc, secondary)
+            logger.warning("provider %s failed (%s); trying the next hop", provider, exc)
             last_error = exc
 
     if not attempted:

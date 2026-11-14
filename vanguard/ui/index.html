@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VanguardAI Control Panel</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { darkMode: "class" };
+  </script>
+</head>
+<body class="min-h-screen bg-slate-950 text-slate-100 antialiased">
+  <header class="border-b border-slate-800 bg-slate-900/60">
+    <div class="mx-auto flex max-w-6xl items-center justify-between px-4 py-4">
+      <div>
+        <h1 class="text-lg font-semibold tracking-tight">VanguardAI</h1>
+        <p class="text-xs text-slate-400">Provider and model routing control panel</p>
+      </div>
+      <span id="status" class="text-xs text-slate-400">Loading...</span>
+    </div>
+  </header>
+
+  <nav class="mx-auto flex max-w-6xl gap-1 px-4 pt-4">
+    <button data-tab="providers" class="tab rounded-t-md px-4 py-2 text-sm font-medium">Providers</button>
+    <button data-tab="models" class="tab rounded-t-md px-4 py-2 text-sm font-medium">Model Config</button>
+  </nav>
+
+  <main class="mx-auto max-w-6xl px-4 py-6">
+    <section id="tab-providers">
+      <div class="mb-4 flex items-center justify-between">
+        <p class="text-sm text-slate-400">Cloud and local providers are discovered from their <code>/models</code> endpoint.</p>
+        <button id="add-provider" class="rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium hover:bg-indigo-500">
+          + Add Provider
+        </button>
+      </div>
+      <div id="provider-groups" class="space-y-8"></div>
+    </section>
+
+    <section id="tab-models" class="hidden">
+      <div class="mb-6 flex flex-wrap items-center gap-3">
+        <button id="refresh-models" class="rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium hover:bg-indigo-500">
+          Refresh Models
+        </button>
+        <span id="model-count" class="text-sm text-slate-400">0 models discovered</span>
+      </div>
+
+      <div class="grid gap-6 lg:grid-cols-2">
+        <div class="rounded-lg border border-slate-800 bg-slate-900 p-4">
+          <h2 class="mb-3 text-sm font-semibold text-slate-200">Default Model</h2>
+          <p class="mb-2 text-xs text-slate-400">Used for "auto", a missing model, or an unmapped id.</p>
+          <input id="default-model" list="model-options" placeholder="groq/openai/gpt-oss-20b"
+            class="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-indigo-500">
+        </div>
+
+        <div class="rounded-lg border border-slate-800 bg-slate-900 p-4">
+          <h2 class="mb-3 text-sm font-semibold text-slate-200">Fallback Models</h2>
+          <p class="mb-2 text-xs text-slate-400">Tried in order after the primary fails. Disabled providers are skipped.</p>
+          <ul id="fallback-list" class="mb-3 space-y-2"></ul>
+          <div class="flex gap-2">
+            <input id="fallback-input" list="model-options" placeholder="openrouter/deepseek/deepseek-chat"
+              class="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-indigo-500">
+            <button id="fallback-add" class="rounded-md border border-slate-700 px-3 py-2 text-sm hover:bg-slate-800">Add</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="mt-6 rounded-lg border border-slate-800 bg-slate-900 p-4">
+        <h2 class="mb-1 text-sm font-semibold text-slate-200">Alias Overrides</h2>
+        <p class="mb-3 text-xs text-slate-400">A request may use an alias as its model id. Leave blank to inherit the default.</p>
+        <div id="alias-grid" class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3"></div>
+      </div>
+
+      <div class="mt-6 flex justify-end">
+        <button id="apply-routing" class="rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium hover:bg-emerald-500">
+          Apply Routing
+        </button>
+      </div>
+    </section>
+  </main>
+
+  <footer class="mx-auto max-w-6xl px-4 pb-8 text-xs text-slate-500">
+    The admin API is unauthenticated. Put it behind a reverse proxy with authentication before exposing the gateway.
+  </footer>
+
+  <datalist id="model-options"></datalist>
+
+  <dialog id="provider-modal" class="w-full max-w-lg rounded-lg border border-slate-700 bg-slate-900 p-0 text-slate-100 backdrop:bg-black/70">
+    <form id="provider-form" method="dialog" class="space-y-3 p-5">
+      <h2 id="modal-title" class="text-base font-semibold">Configure Provider</h2>
+      <div class="grid gap-3 sm:grid-cols-2">
+        <label class="block text-xs text-slate-400">Provider ID
+          <input id="f-id" required pattern="[a-z0-9][a-z0-9_-]*"
+            class="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-indigo-500">
+        </label>
+        <label class="block text-xs text-slate-400">Name
+          <input id="f-name"
+            class="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-indigo-500">
+        </label>
+      </div>
+      <label class="block text-xs text-slate-400">Category
+        <select id="f-category"
+          class="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-indigo-500">
+          <option value="cloud">Cloud</option>
+          <option value="local">Local</option>
+          <option value="custom">Custom</option>
+        </select>
+      </label>
+      <label class="block text-xs text-slate-400">Base URL
+        <input id="f-base-url" required placeholder="https://api.example.com/v1"
+          class="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-indigo-500">
+      </label>
+      <label class="block text-xs text-slate-400">API Key
+        <input id="f-api-key" type="password" autocomplete="off"
+          class="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-100 outline-none focus:border-indigo-500">
+        <span class="mt-1 block text-[11px] text-slate-500">Leave blank to keep the stored key.</span>
+      </label>
+      <label class="flex items-center gap-2 text-sm">
+        <input id="f-enabled" type="checkbox" class="h-4 w-4 rounded border-slate-600 bg-slate-950">
+        Enabled
+      </label>
+      <p id="modal-error" class="hidden rounded bg-red-950 px-3 py-2 text-xs text-red-300"></p>
+      <div class="flex justify-end gap-2 pt-2">
+        <button type="button" id="modal-cancel" class="rounded-md border border-slate-700 px-3 py-2 text-sm hover:bg-slate-800">Cancel</button>
+        <button type="submit" class="rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium hover:bg-indigo-500">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="toast" class="pointer-events-none fixed bottom-4 right-4 hidden rounded-md bg-slate-800 px-4 py-2 text-sm shadow-lg"></div>
+
+  <script>
+    const state = {
+      providers: [],
+      routing: { default_model: "", alias_overrides: {}, fallback_models: [] },
+      models: [],
+    };
+
+    const $ = (id) => document.getElementById(id);
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        headers: { "Content-Type": "application/json" },
+        ...options,
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error((body.error && body.error.message) || response.statusText);
+      }
+      return body;
+    }
+
+    function toast(message, isError = false) {
+      const node = $("toast");
+      node.textContent = message;
+      node.className =
+        "pointer-events-none fixed bottom-4 right-4 rounded-md px-4 py-2 text-sm shadow-lg " +
+        (isError ? "bg-red-900 text-red-100" : "bg-slate-800 text-slate-100");
+      clearTimeout(toast.timer);
+      toast.timer = setTimeout(() => node.classList.add("hidden"), 3500);
+    }
+
+    function element(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+
+    // ---------------------------------------------------------------- tabs
+    document.querySelectorAll(".tab").forEach((button) => {
+      button.addEventListener("click", () => selectTab(button.dataset.tab));
+    });
+
+    function selectTab(name) {
+      document.querySelectorAll(".tab").forEach((button) => {
+        const active = button.dataset.tab === name;
+        button.className =
+          "tab rounded-t-md px-4 py-2 text-sm font-medium " +
+          (active ? "bg-slate-900 text-white" : "text-slate-400 hover:text-slate-200");
+      });
+      $("tab-providers").classList.toggle("hidden", name !== "providers");
+      $("tab-models").classList.toggle("hidden", name !== "models");
+    }
+
+    // ----------------------------------------------------------- providers
+    function providerCard(provider) {
+      const card = element("div", "rounded-lg border border-slate-800 bg-slate-900 p-4");
+      const head = element("div", "flex items-start justify-between gap-3");
+      const title = element("div", "");
+      title.append(element("p", "font-medium", provider.name));
+      title.append(element("p", "text-xs text-slate-500", provider.id));
+      const badge = element(
+        "span",
+        "rounded-full px-2 py-0.5 text-[11px] " +
+          (provider.enabled
+            ? "bg-emerald-900 text-emerald-300"
+            : "bg-slate-800 text-slate-400"),
+        provider.enabled ? "enabled" : "disabled"
+      );
+      head.append(title, badge);
+
+      const health = element(
+        "p",
+        "mt-3 text-xs " +
+          (provider.health === "ok"
+            ? "text-emerald-400"
+            : provider.health === "unreachable"
+            ? "text-red-400"
+            : "text-slate-500"),
+        provider.health === "ok"
+          ? provider.model_count + " models"
+          : provider.health === "unreachable"
+          ? "unreachable"
+          : "not refreshed"
+      );
+      const url = element("p", "mt-1 truncate text-xs text-slate-500", provider.base_url);
+      const key = element("p", "mt-1 text-xs text-slate-500", provider.api_key || "no API key");
+
+      const edit = element(
+        "button",
+        "mt-3 rounded-md border border-slate-700 px-3 py-1.5 text-xs hover:bg-slate-800",
+        "Configure"
+      );
+      edit.addEventListener("click", () => openProviderModal(provider));
+
+      card.append(head, health, url, key, edit);
+      return card;
+    }
+
+    function renderProviders() {
+      const groups = { cloud: [], local: [], custom: [] };
+      state.providers.forEach((provider) => {
+        (groups[provider.category] || groups.custom).push(provider);
+      });
+      const titles = { cloud: "Cloud Providers", local: "Local Providers", custom: "Custom Providers" };
+      const root = $("provider-groups");
+      root.replaceChildren();
+      Object.entries(titles).forEach(([category, title]) => {
+        const section = element("section", "");
+        section.append(element("h2", "mb-3 text-sm font-semibold text-slate-300", title));
+        const grid = element("div", "grid gap-3 sm:grid-cols-2 lg:grid-cols-3");
+        if (groups[category].length === 0) {
+          grid.append(element("p", "text-xs text-slate-500", "None yet."));
+        }
+        groups[category].forEach((provider) => grid.append(providerCard(provider)));
+        section.append(grid);
+        root.append(section);
+      });
+    }
+
+    let editingId = null;
+
+    function openProviderModal(provider) {
+      editingId = provider ? provider.id : null;
+      $("modal-title").textContent = provider ? "Configure Provider" : "Add Provider";
+      $("f-id").value = provider ? provider.id : "";
+      $("f-id").disabled = Boolean(provider);
+      $("f-name").value = provider ? provider.name : "";
+      $("f-category").value = provider ? provider.category : "custom";
+      $("f-base-url").value = provider ? provider.base_url : "";
+      $("f-api-key").value = "";
+      $("f-api-key").placeholder = provider && provider.api_key ? provider.api_key : "";
+      $("f-enabled").checked = provider ? provider.enabled : true;
+      $("modal-error").classList.add("hidden");
+      $("provider-modal").showModal();
+    }
+
+    $("add-provider").addEventListener("click", () => openProviderModal(null));
+    $("modal-cancel").addEventListener("click", () => $("provider-modal").close());
+
+    $("provider-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const payload = {
+        id: $("f-id").value.trim(),
+        name: $("f-name").value.trim() || undefined,
+        category: $("f-category").value,
+        base_url: $("f-base-url").value.trim(),
+        enabled: $("f-enabled").checked,
+      };
+      const key = $("f-api-key").value.trim();
+      if (key) payload.api_key = key;
+
+      try {
+        await api("/v1/admin/providers", { method: "POST", body: JSON.stringify(payload) });
+        $("provider-modal").close();
+        await loadProviders();
+        toast("Provider saved.");
+      } catch (error) {
+        const node = $("modal-error");
+        node.textContent = error.message;
+        node.classList.remove("hidden");
+      }
+    });
+
+    // -------------------------------------------------------------- models
+    function modelInput(id) {
+      const input = element("input", "w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-indigo-500");
+      input.id = id;
+      input.setAttribute("list", "model-options");
+      input.addEventListener("change", () => {
+        if (id === "default-model") state.routing.default_model = input.value.trim();
+      });
+      return input;
+    }
+
+    function renderAliases() {
+      const root = $("alias-grid");
+      root.replaceChildren();
+      state.routing.alias_overrides = state.routing.alias_overrides || {};
+      (["fast", "smart", "coding", "opus", "sonnet", "haiku"]).forEach((name) => {
+        const label = element("label", "block text-xs text-slate-400", name);
+        const input = modelInput("alias-" + name);
+        input.value = state.routing.alias_overrides[name] || "";
+        input.placeholder = "inherit default";
+        input.addEventListener("change", () => {
+          state.routing.alias_overrides[name] = input.value.trim() || null;
+        });
+        label.append(input);
+        root.append(label);
+      });
+    }
+
+    function renderFallbacks() {
+      const root = $("fallback-list");
+      root.replaceChildren();
+      const fallbacks = state.routing.fallback_models || [];
+      if (fallbacks.length === 0) {
+        root.append(element("li", "text-xs text-slate-500", "No fallbacks configured."));
+        return;
+      }
+      fallbacks.forEach((model, index) => {
+        const row = element("li", "flex items-center gap-2 rounded-md bg-slate-950 px-2 py-1.5");
+        row.append(element("span", "w-5 text-xs text-slate-500", String(index + 1)));
+        row.append(element("span", "flex-1 truncate text-xs", model));
+        const move = (delta) => {
+          const next = index + delta;
+          if (next < 0 || next >= fallbacks.length) return;
+          [fallbacks[index], fallbacks[next]] = [fallbacks[next], fallbacks[index]];
+          state.routing.fallback_models = fallbacks;
+          renderFallbacks();
+        };
+        const up = element("button", "px-1 text-xs text-slate-400 hover:text-white", "up");
+        up.addEventListener("click", () => move(-1));
+        const down = element("button", "px-1 text-xs text-slate-400 hover:text-white", "down");
+        down.addEventListener("click", () => move(1));
+        const remove = element("button", "px-1 text-xs text-red-400 hover:text-red-300", "remove");
+        remove.addEventListener("click", () => {
+          fallbacks.splice(index, 1);
+          state.routing.fallback_models = fallbacks;
+          renderFallbacks();
+        });
+        row.append(up, down, remove);
+        root.append(row);
+      });
+    }
+
+    function renderModelOptions() {
+      const datalist = $("model-options");
+      datalist.replaceChildren();
+      state.models.forEach((id) => {
+        const option = document.createElement("option");
+        option.value = id;
+        datalist.append(option);
+      });
+      $("model-count").textContent = state.models.length + " models discovered";
+    }
+
+    function renderModels() {
+      $("default-model").value = state.routing.default_model || "";
+      renderAliases();
+      renderFallbacks();
+      renderModelOptions();
+    }
+
+    $("fallback-add").addEventListener("click", () => {
+      const input = $("fallback-input");
+      const value = input.value.trim();
+      if (!value) return;
+      state.routing.fallback_models = state.routing.fallback_models || [];
+      if (!state.routing.fallback_models.includes(value)) {
+        state.routing.fallback_models.push(value);
+        renderFallbacks();
+      }
+      input.value = "";
+    });
+
+    $("refresh-models").addEventListener("click", async () => {
+      const button = $("refresh-models");
+      button.disabled = true;
+      button.textContent = "Refreshing...";
+      try {
+        const result = await api("/v1/admin/models/refresh", { method: "POST" });
+        state.models = (result.data || []).map((entry) => entry.id);
+        renderModelOptions();
+        const statuses = result.providers || {};
+        const unreachable = Object.entries(statuses)
+          .filter(([, status]) => status.status !== "ok")
+          .map(([id]) => id);
+        await loadProviders();
+        toast(
+          state.models.length + " models from " + Object.keys(statuses).length + " providers" +
+            (unreachable.length ? " (unreachable: " + unreachable.join(", ") + ")" : ""),
+          unreachable.length > 0
+        );
+      } catch (error) {
+        toast(error.message, true);
+      } finally {
+        button.disabled = false;
+        button.textContent = "Refresh Models";
+      }
+    });
+
+    $("apply-routing").addEventListener("click", async () => {
+      const payload = {
+        default_model: $("default-model").value.trim(),
+        alias_overrides: state.routing.alias_overrides || {},
+        fallback_models: state.routing.fallback_models || [],
+      };
+      try {
+        state.routing = await api("/v1/admin/routing", {
+          method: "POST",
+          body: JSON.stringify(payload),
+        });
+        renderModels();
+        toast("Routing applied.");
+      } catch (error) {
+        toast(error.message, true);
+      }
+    });
+
+    // ---------------------------------------------------------------- boot
+    async function loadProviders() {
+      const result = await api("/v1/admin/providers");
+      state.providers = result.providers;
+      renderProviders();
+    }
+
+    async function boot() {
+      selectTab("providers");
+      try {
+        const [providers, routing] = await Promise.all([
+          api("/v1/admin/providers"),
+          api("/v1/admin/routing"),
+        ]);
+        state.providers = providers.providers;
+        state.routing = routing;
+        renderProviders();
+        renderModels();
+        const catalog = await api("/v1/models");
+        state.models = (catalog.data || []).map((entry) => entry.id);
+        renderModelOptions();
+        $("status").textContent = state.providers.filter((p) => p.enabled).length + " enabled providers";
+      } catch (error) {
+        $("status").textContent = "Gateway unreachable";
+        toast(error.message, true);
+      }
+    }
+
+    boot();
+  </script>
+</body>
+</html>
